@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Alejandro Sánchez
+"""macOS-style "snip to clipboard" (Cmd+Ctrl+Shift+4) for X11 desktops.
+
+Stays resident and grabs its shortcut globally. When the shortcut is pressed it takes
+the screenshot at that very instant, so tooltips and hover effects are kept, shows the
+frozen screen to select a region and copies it to the clipboard when the mouse button
+is released. Esc or the right mouse button cancel.
+"""
+import os
+import signal
+import sys
+
+# Work in physical pixels: the screenshot and the window must match 1:1.
+for var in ("QT_SCREEN_SCALE_FACTORS", "QT_SCALE_FACTOR"):
+    os.environ.pop(var, None)
+os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
+os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
+
+from PyQt5.QtCore import QPoint, QProcess, QRect, QSocketNotifier, Qt, QTimer  # noqa: E402
+from PyQt5.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen  # noqa: E402
+from PyQt5.QtWidgets import QApplication, QWidget  # noqa: E402
+from Xlib import X, XK, display, error  # noqa: E402
+
+# (keysym, modifiers) that trigger a snip
+SHORTCUTS = [
+    ("4", X.Mod4Mask | X.ControlMask | X.ShiftMask),  # Meta+Ctrl+Shift+4
+]
+# Also trigger with NumLock (Mod2) and CapsLock on
+LOCK_VARIANTS = (0, X.Mod2Mask, X.LockMask, X.Mod2Mask | X.LockMask)
+SELECTION_FILL = QColor(255, 255, 255, 50)
+SELECTION_BORDER = QColor(255, 255, 255, 200)
+LABEL_MARGIN = 80
+# Played with paplay after copying; set to "" for silence
+SHUTTER_SOUND = "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga"
+
+
+class Overlay(QWidget):
+    """Full-screen frozen screenshot on which the region is selected."""
+
+    def __init__(self):
+        super().__init__(None, Qt.Window | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+                         | Qt.X11BypassWindowManagerHint)
+        self.setCursor(Qt.CrossCursor)
+        self.setMouseTracking(True)
+        self.shot = None
+        self.origin = None
+        self.selection = QRect()
+
+    def start(self, shot, geometry):
+        self.shot = shot
+        self.origin = None
+        self.selection = QRect()
+        self.setGeometry(geometry)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.grab_input(200)
+
+    def grab_input(self, tries):
+        # While the shortcut key is still held, the keyboard stays grabbed by the Xlib
+        # connection and X refuses the grab: retry until the key is released.
+        win = self.windowHandle()
+        if win is None or not self.isVisible():
+            return
+        grabbed = win.setKeyboardGrabEnabled(True) and win.setMouseGrabEnabled(True)
+        if not grabbed and tries:
+            QTimer.singleShot(10, lambda: self.grab_input(tries - 1))
+
+    def finish(self, rect):
+        win = self.windowHandle()
+        win.setKeyboardGrabEnabled(False)
+        win.setMouseGrabEnabled(False)
+        self.hide()
+        if rect is not None:
+            QApplication.clipboard().setPixmap(self.shot.copy(rect))
+            if SHUTTER_SOUND:
+                QProcess.startDetached("paplay", [SHUTTER_SOUND])
+        self.shot = None
+
+    def update_selection(self, rect):
+        dirty = self.selection.united(rect).adjusted(-LABEL_MARGIN, -LABEL_MARGIN, LABEL_MARGIN * 3, LABEL_MARGIN)
+        self.selection = rect
+        self.update(dirty)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.drawPixmap(event.rect(), self.shot, event.rect())
+        if self.selection.isEmpty():
+            return
+        r = self.selection
+        p.fillRect(r, SELECTION_FILL)
+        p.setPen(QPen(SELECTION_BORDER, 1))
+        p.drawRect(r.adjusted(0, 0, -1, -1))
+        label = f"{r.width()} × {r.height()}"
+        p.setFont(QFont("sans-serif", 11))
+        box = p.fontMetrics().boundingRect(label).adjusted(-6, -3, 6, 3)
+        box.moveTopLeft(r.bottomRight() + QPoint(8, 8))
+        p.fillRect(box, QColor(0, 0, 0, 160))
+        p.setPen(Qt.white)
+        p.drawText(box, Qt.AlignCenter, label)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == Qt.LeftButton:
+            self.origin = ev.pos()
+            self.update_selection(QRect(self.origin, self.origin))
+        else:
+            self.finish(None)
+
+    def mouseMoveEvent(self, ev):
+        if self.origin is not None:
+            self.update_selection(QRect(self.origin, ev.pos()).normalized())
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() != Qt.LeftButton or self.origin is None:
+            return
+        rect = QRect(self.origin, ev.pos()).normalized()
+        self.finish(rect if rect.width() > 2 and rect.height() > 2 else None)
+
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key_Escape:
+            self.finish(None)
+
+
+class Snipper:
+    """Grabs the shortcuts through Xlib and starts a snip as soon as the key press arrives."""
+
+    def __init__(self):
+        self.display = display.Display()
+        root = self.display.screen().root
+        geom = root.get_geometry()
+        self.screen_rect = QRect(0, 0, geom.width, geom.height)
+        busy = error.CatchError(error.BadAccess)
+        for keysym, mods in SHORTCUTS:
+            code = self.display.keysym_to_keycode(XK.string_to_keysym(keysym))
+            for lock in LOCK_VARIANTS:
+                root.grab_key(code, mods | lock, True, X.GrabModeAsync, X.GrabModeAsync, onerror=busy)
+        self.display.sync()
+        if busy.get_error():
+            sys.exit("snip-to-clipboard: another application already uses the shortcut (is it already running?)")
+        self.overlay = Overlay()
+        self.notifier = QSocketNotifier(self.display.fileno(), QSocketNotifier.Read)
+        self.notifier.activated.connect(self.handle_x_events)
+        QTimer.singleShot(0, self.handle_x_events)
+
+    def handle_x_events(self):
+        while self.display.pending_events():
+            ev = self.display.next_event()
+            if ev.type == X.KeyPress and not self.overlay.isVisible():
+                # Capture right away, before anything on screen reacts to the shortcut
+                r = self.screen_rect
+                shot = QGuiApplication.primaryScreen().grabWindow(0, r.x(), r.y(), r.width(), r.height())
+                self.overlay.start(shot, r)
+
+
+def main():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    QApplication.setAttribute(Qt.AA_DisableHighDpiScaling)
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    snipper = Snipper()  # noqa: F841 (must stay alive)
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
