@@ -44,7 +44,7 @@ Edit the constants at the top of `snip-to-clipboard` and run `./install.sh` agai
 |---|---|---|
 | `SHORTCUTS` | Meta+Ctrl+Shift+4 | List of `(keysym, modifiers)` that start a snip, e.g. `("Print", 0)` for the Print key. |
 | `SHUTTER_SOUND` | freedesktop `camera-shutter.oga` | Sound played after copying; `""` for silence. |
-| `SELECTION_FILL`, `SELECTION_BORDER` | translucent white | Selection colours. |
+| `SELECTION_FILL`, `SELECTION_BORDER` | translucent grey, white border | Selection colours. |
 
 ## License
 

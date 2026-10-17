@@ -19,7 +19,7 @@ os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
 os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
 
 from PyQt5.QtCore import QPoint, QProcess, QRect, QSocketNotifier, Qt, QTimer  # noqa: E402
-from PyQt5.QtGui import QColor, QFont, QGuiApplication, QPainter, QPen  # noqa: E402
+from PyQt5.QtGui import QColor, QCursor, QFont, QGuiApplication, QPainter, QPen  # noqa: E402
 from PyQt5.QtWidgets import QApplication, QWidget  # noqa: E402
 from Xlib import X, XK, display, error  # noqa: E402
 
@@ -29,7 +29,8 @@ SHORTCUTS = [
 ]
 # Also trigger with NumLock (Mod2) and CapsLock on
 LOCK_VARIANTS = (0, X.Mod2Mask, X.LockMask, X.Mod2Mask | X.LockMask)
-SELECTION_FILL = QColor(255, 255, 255, 50)
+# Mid grey like macOS: darkens light backgrounds and lightens dark ones
+SELECTION_FILL = QColor(128, 128, 128, 64)
 SELECTION_BORDER = QColor(255, 255, 255, 200)
 LABEL_MARGIN = 80
 # Played with paplay after copying; set to "" for silence
@@ -47,11 +48,13 @@ class Overlay(QWidget):
         self.shot = None
         self.origin = None
         self.selection = QRect()
+        self.pointer = QPoint()
 
     def start(self, shot, geometry):
         self.shot = shot
         self.origin = None
         self.selection = QRect()
+        self.pointer = QCursor.pos() - geometry.topLeft()
         self.setGeometry(geometry)
         self.show()
         self.raise_()
@@ -79,38 +82,62 @@ class Overlay(QWidget):
                 QProcess.startDetached("paplay", [SHUTTER_SOUND])
         self.shot = None
 
-    def update_selection(self, rect):
-        dirty = self.selection.united(rect).adjusted(-LABEL_MARGIN, -LABEL_MARGIN, LABEL_MARGIN * 3, LABEL_MARGIN)
+    def update_selection(self, rect, pointer):
+        dirty = self.selection.united(rect).adjusted(-LABEL_MARGIN, -LABEL_MARGIN, LABEL_MARGIN, LABEL_MARGIN)
         self.selection = rect
+        self.pointer = pointer
+        self.update(dirty)
+
+    def move_pointer(self, pos):
+        dirty = QRect(self.pointer, pos).normalized().adjusted(-LABEL_MARGIN, -LABEL_MARGIN, LABEL_MARGIN, LABEL_MARGIN)
+        self.pointer = pos
         self.update(dirty)
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.drawPixmap(event.rect(), self.shot, event.rect())
-        if self.selection.isEmpty():
+        if self.origin is None:
+            # Before dragging, the pointer coordinates
+            self.draw_label(p, self.pointer.x(), self.pointer.y())
             return
         r = self.selection
         p.fillRect(r, SELECTION_FILL)
         p.setPen(QPen(SELECTION_BORDER, 1))
         p.drawRect(r.adjusted(0, 0, -1, -1))
-        label = f"{r.width()} × {r.height()}"
-        p.setFont(QFont("sans-serif", 11))
-        box = p.fontMetrics().boundingRect(label).adjusted(-6, -3, 6, 3)
-        box.moveTopLeft(r.bottomRight() + QPoint(8, 8))
-        p.fillRect(box, QColor(0, 0, 0, 160))
+        self.draw_label(p, r.width(), r.height())
+
+    def draw_label(self, p, first, second):
+        """Two numbers stacked next to the pointer, flipped to the other side near the screen edges."""
+        label = f"{first}\n{second}"
+        font = QFont("sans-serif")
+        font.setPixelSize(11)
+        font.setStyleStrategy(QFont.NoSubpixelAntialias)
+        p.setFont(font)
+        box = p.fontMetrics().boundingRect(QRect(), Qt.AlignLeft, label)
+        box.moveTopLeft(self.pointer + QPoint(7, 4))
+        if box.right() >= self.width():
+            box.moveRight(self.pointer.x() - 7)
+        if box.bottom() >= self.height():
+            box.moveBottom(self.pointer.y() - 4)
+        # White text outlined in black, readable on any background
+        p.setPen(Qt.black)
+        for dx, dy in ((-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)):
+            p.drawText(box.translated(dx, dy), Qt.AlignLeft, label)
         p.setPen(Qt.white)
-        p.drawText(box, Qt.AlignCenter, label)
+        p.drawText(box, Qt.AlignLeft, label)
 
     def mousePressEvent(self, ev):
         if ev.button() == Qt.LeftButton:
             self.origin = ev.pos()
-            self.update_selection(QRect(self.origin, self.origin))
+            self.update_selection(QRect(self.origin, self.origin), ev.pos())
         else:
             self.finish(None)
 
     def mouseMoveEvent(self, ev):
-        if self.origin is not None:
-            self.update_selection(QRect(self.origin, ev.pos()).normalized())
+        if self.origin is None:
+            self.move_pointer(ev.pos())
+        else:
+            self.update_selection(QRect(self.origin, ev.pos()).normalized(), ev.pos())
 
     def mouseReleaseEvent(self, ev):
         if ev.button() != Qt.LeftButton or self.origin is None:
